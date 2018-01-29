@@ -34,40 +34,81 @@ string hasData(string s) {
   return "";
 }
 
+/**
+ * @brief Calculates the euclidean distance between two points.
+ *
+ * @param x1 The X coordinate of the 1st point.
+ * @param y1 The Y coordinate of the 1st point.
+ * @param x2 The X coordinate of the 2nd point.
+ * @param y2 The Y coordinate of the 2nd point.
+ * @return the distance.
+ */
 double distance(double x1, double y1, double x2, double y2)
 {
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
 }
-int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
+
+/**
+ * @brief Calculates the norm of a vector that starts from (0,0)
+ *        and ends at (x, y)
+ *
+ * @param x The X coordinate.
+ * @param y The Y coordinate.
+ * @return The norm of the vector.
+ */
+double norm(double x, double y)
+{
+  return distance(0, 0, x, y);
+}
+
+/**
+ * @brief Find the closest map waypoint to our current location.
+ *
+ * @param x       Current X position.
+ * @param y       Current Y position.
+ * @param maps_x  Vector of X position waypoints.
+ * @param maps_y  Vector of X position waypoints.
+ * @return The index of the closest waypoint
+ */
+int closestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
-	double closestLen = 100000; //large number
-	int closestWaypoint = 0;
+	double closestLen   = INFINITY;
+	int closestWaypointIdx = 0;
 
 	for(int i = 0; i < maps_x.size(); i++)
 	{
 		double map_x = maps_x[i];
 		double map_y = maps_y[i];
-		double dist = distance(x,y,map_x,map_y);
+		double dist  = distance(x,y,map_x,map_y);
 		if(dist < closestLen)
 		{
 			closestLen = dist;
-			closestWaypoint = i;
+			closestWaypointIdx = i;
 		}
 
 	}
 
-	return closestWaypoint;
-
+	return closestWaypointIdx;
 }
 
-int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+/**
+ * @brief The next waypoint to get to from the car current location and heading.
+ *
+ * @param x       The X location of the car in map coordinates.
+ * @param y       The Y location of the car in map coordinates.
+ * @param theta   The car heading in map coordinates.
+ * @param maps_x  Map waypoints in X coordinate.
+ * @param maps_y  Map waypoints in Y coordinate.
+ * @return The index of the next waypoint to drive to.
+ */
+int nextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
-	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
+	int closestWaypointIdx = closestWaypoint(x,y,maps_x,maps_y);
 
-	double map_x = maps_x[closestWaypoint];
-	double map_y = maps_y[closestWaypoint];
+	double map_x = maps_x[closestWaypointIdx];
+	double map_y = maps_y[closestWaypointIdx];
 
 	double heading = atan2((map_y-y),(map_x-x));
 
@@ -76,20 +117,20 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 
   if(angle > pi()/4)
   {
-    closestWaypoint++;
-  if (closestWaypoint == maps_x.size())
+    closestWaypointIdx++;
+  if (closestWaypointIdx == maps_x.size())
   {
-    closestWaypoint = 0;
+    closestWaypointIdx = 0;
   }
   }
 
-  return closestWaypoint;
+  return closestWaypointIdx;
 }
 
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
 vector<double> getFrenet(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
 {
-	int next_wp = NextWaypoint(x,y, theta, maps_x,maps_y);
+	int next_wp = nextWaypoint(x,y, theta, maps_x,maps_y);
 
 	int prev_wp;
 	prev_wp = next_wp-1;
@@ -242,10 +283,18 @@ int main() {
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+          	// Go in a straight line.
+            double dist_inc = 0.5;
+            for(int i = 0; i < 50; i++)
+            {
+            	next_x_vals.push_back(car_x+(dist_inc*i)*cos(deg2rad(car_yaw)));
+                next_y_vals.push_back(car_y+(dist_inc*i)*sin(deg2rad(car_yaw)));
+            }
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
+
 
           	auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
