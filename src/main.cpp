@@ -9,6 +9,8 @@
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
 
+#include "PathPlanner.hpp"
+
 using namespace std;
 
 // for convenience
@@ -18,6 +20,9 @@ using json = nlohmann::json;
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
+
+constexpr double SPEED_LIMIT = 50;
+constexpr double LANE_WIDTH = 4;
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -207,6 +212,8 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 int main() {
   uWS::Hub h;
 
+  PathPlanner planner(SPEED_LIMIT, LANE_WIDTH);
+
   // Load up map values for waypoint's x,y,s and d normalized normal vectors
   vector<double> map_waypoints_x;
   vector<double> map_waypoints_y;
@@ -241,7 +248,7 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&planner](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -268,6 +275,8 @@ int main() {
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
 
+          	Vehicle vehicle = {car_s, car_d, car_speed};
+
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
@@ -280,17 +289,33 @@ int main() {
 
           	json msgJson;
 
+          	Path fernetPath = planner.planPath(vehicle, sensor_fusion, previous_path_x.size());
+
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+          	// Convert Fernet path to cartesian coordinates
+          	for (size_t path_val = 0; path_val < fernetPath.length(); ++path_val)
+          	{
+          	  double s = fernetPath.s[path_val];
+          	  double d = fernetPath.d[path_val];
+
+          	  vector<double> xy_vec = getXY(s, d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+          	  // xy_vec is composed of {X,Y} -> `0` is X and `1` is Y.
+          	  next_x_vals.push_back(xy_vec[0]);
+          	  next_y_vals.push_back(xy_vec[1]);
+          	}
+
+#if 0
           	// Go in a straight line.
             double dist_inc = 0.5;
             for(int i = 0; i < 50; i++)
             {
             	next_x_vals.push_back(car_x+(dist_inc*i)*cos(deg2rad(car_yaw)));
-                next_y_vals.push_back(car_y+(dist_inc*i)*sin(deg2rad(car_yaw)));
+              next_y_vals.push_back(car_y+(dist_inc*i)*sin(deg2rad(car_yaw)));
             }
-
+#endif
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
