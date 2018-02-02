@@ -21,8 +21,10 @@ constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
 
-constexpr double SPEED_LIMIT = 50;
-constexpr double LANE_WIDTH = 4;
+constexpr float SPEED_LIMIT = 50;
+constexpr float LANE_WIDTH = 4;
+constexpr float DELTA_T = 0.02;
+constexpr float SECONDS_AHEAD = 1;
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -212,7 +214,7 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 int main() {
   uWS::Hub h;
 
-  PathPlanner planner(SPEED_LIMIT, LANE_WIDTH);
+  PathPlanner planner(SPEED_LIMIT, LANE_WIDTH, DELTA_T, SECONDS_AHEAD);
 
   // Load up map values for waypoint's x,y,s and d normalized normal vectors
   vector<double> map_waypoints_x;
