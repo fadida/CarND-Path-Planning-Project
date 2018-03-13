@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <vector>
+#include <cmath>
 
 /**
  * Represents the path that the path planner
@@ -15,10 +16,14 @@ struct Path
 
   double acceleration;
 
+  Path(size_t size): s(size), d(size), acceleration(0)
+  {}
+
   size_t size()
   {
     return s.size();
   }
+
 };
 
 /**
@@ -26,82 +31,85 @@ struct Path
  */
 struct Vehicle
 {
+  static constexpr size_t NOT_OBSTACLE_VEHICLE_ID = 0xFFFFFFFF;
   unsigned int id;
   double s;
   double d;
   double velocity; /* Vehicle velocity in meter per second. */
 };
 
-
 class PathPlanner {
  public:
   static constexpr size_t UNKNOWN_LANE = 0xFFFFFFFF;
 
-  PathPlanner(double speed_limit, double max_acceleration, float max_jerk, float lane_width, size_t path_size = 3, float safety_time = 0.5);
+  PathPlanner(double speed_limit, double max_acceleration, float max_jerk, float lane_width, size_t n_lanes, double delta_t, size_t path_size, double max_s_val = INFINITY);
 
-  Path planPath(const Vehicle& vehicle, const std::vector<std::vector<double>>& sensor_fusion);
+  Path planPath(const Vehicle& vehicle, const std::vector<std::vector<Vehicle>>& obstacle_predictions);
 
  private:
 
-  /**
-   * @brief Gets the lane index (starting from zero) from Frenet d coordinate.
-   * @param d Frenet d coordinate.
-   * @return lane index.
-   */
   unsigned int getLaneIndex(double d);
 
-  /**
-   * @brief Gets the D coordinate that correspond to the lane `lane_idx`.
-   * @param lane_idx Lane index
-   * @return Frenet d coordinate
-   */
   double getDFromLane(unsigned int lane_idx);
 
-  Path generatePathPoints(const Vehicle& vehicle, const std::vector<double>& lane_velocities);
+  std::vector<double> calculateLaneVelocities(const Vehicle& vehicle, const std::vector<std::vector<Vehicle>>& obstacle_predictions);
 
-  std::vector<double> getLaneVelocities(const Vehicle& vehicle, const std::vector<std::vector<double>>& sensor_fusion);
+  std::vector<bool> checkIfPathsAreClear(const Vehicle& vehicle, const std::vector<std::vector<Vehicle>>& obstacle_predictions);
 
-  /* Path that the planner has created,
-   * represented as a vector of a double vector when
-   * the outer vector is for coordinate (s or d) and
-   * the inner vector is for the actual points. */
-  Path path_;
+  void updateSafetyDistance(const Vehicle& vehicle);
+
+  bool isObstacleTooClose(const Vehicle& vehicle, const Vehicle& obstacle);
+
+  bool isObstacleBehind(const Vehicle& vehicle, const Vehicle& obstacle);
+
+  Path createPath(const Vehicle& vehicle, unsigned int target_lane_idx);
+
+  Path createDummyPath(const Vehicle& vehicle, unsigned int target_lane_idx);
+
+  void updateLaneVelocities(const std::vector<double>& lane_velocities);
+
+  double getPathAccelaration(const Vehicle& vehicle, unsigned int target_lane_idx);
+
+  bool canMakePathDecision(const Vehicle& vehicle);
+
+  double getTimeDerivative(double x_initial, double x_final);
+
+
+  /* The point that the vehicle needs to pass in order for the planner
+   * to recalculate the path. */
+  double critical_s_loc_;
+  /* Maximum s value we can reach (in a cyclic track)*/
+  double max_s_val_;
   /* Speed limit in meter per second. */
   double speed_limit_;
+  /* The maximum acceleration allowed. */
   double max_acceleration_;
+  /* The maximum jerk allowed. */
   double max_jerk_;
+  /* The previous calculated acceleration. */
+  double prev_acceleration_;
   /* Width of the lane. */
   float lane_width_;
+  /* vehicle s position at the last decision.*/
+  double initial_s_pos_;
+  /* vehicle d position at the last decision.*/
+  double initial_d_pos_;
   /* The number of points in generated path. */
   size_t path_size_;
+  /* Number of lanes in track. */
+  size_t n_lanes_;
+  /* The lane velocities. */
+  std::vector<double> lane_velocities_;
+
   /* The time in seconds to keep from the other vehicles.
    * Turns into the safety distance by multiplying by the vehicle speed.*/
   float safety_time_;
-
-  double speed_max_threshold_;
-  double speed_min_threshold_;
-
+  /* Safety distance*/
+  double safety_distance_;
+  /* Delta time. */
   double delta_t_;
-
-  /////////////////////////////////////
-  /// FSM parameters.
-  ////////////////////////////////////
-
-  /*
-   * States for Path Planner FSM.
-   */
-  enum PlannerState
-  {
-    PATH_PLANNER_STATE_KEEP_LANE,           // Keep lane state.
-    PATH_PLANNER_STATE_MATCH_SPEED,         // Match vehicle speed state.
-    PATH_PLANNER_STATE_SWITCH_LANE_LEFT,    // Switch lane left state.
-    PATH_PLANNER_STATE_SWITCH_LANE_RIGHT,   // Switch lane right state.
-  } state_;
-
-  PlannerState prev_state_;
-
+  /* The lane the planner choose. */
   unsigned int target_lane_;
-  unsigned int target_vehicle_id_;
 
 };
 

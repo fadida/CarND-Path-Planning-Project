@@ -24,14 +24,30 @@ double rad2deg(double x) { return x * 180 / pi(); }
 
 // For converting mile per hour to meter per second.
 constexpr double MS2MPS_CONVERSION_FACTOR = 2.23694;
-double ms2mph(double ms) { return ms * MS2MPS_CONVERSION_FACTOR; }
-double mph2ms(double mph) { return mph / MS2MPS_CONVERSION_FACTOR; }
+constexpr double ms2mph(double ms) { return ms * MS2MPS_CONVERSION_FACTOR; }
+constexpr double mph2ms(double mph) { return mph / MS2MPS_CONVERSION_FACTOR; }
 
-
-constexpr float SPEED_LIMIT = 50;
+////////////////////////////////////////////
+///  Project parameters
+//////////////////////////////////////////
+constexpr double SPEED_LIMIT = mph2ms(50.0);
+constexpr double MAX_ACCELARAION = 10;
+constexpr double MAX_JERK = 10;
 constexpr float LANE_WIDTH = 4;
+constexpr size_t LANE_NUM = 3;
 constexpr float DELTA_T = 0.02;
 constexpr float SECONDS_AHEAD = 1;
+constexpr double PLANNER_DELTA_T = 1.5;
+constexpr size_t PLANNER_PATH_SIZE = 4;
+
+
+constexpr size_t SENSOR_FUSION_CAR_ID_IDX = 0;
+constexpr size_t SENSOR_FUSION_CAR_POS_X_IDX = 1;
+constexpr size_t SENSOR_FUSION_CAR_POS_Y_IDX = 2;
+constexpr size_t SENSOR_FUSION_CAR_VEL_X_IDX = 3;
+constexpr size_t SENSOR_FUSION_CAR_VEL_Y_IDX = 4;
+constexpr size_t SENSOR_FUSION_CAR_S_IDX = 5;
+constexpr size_t SENSOR_FUSION_CAR_D_IDX = 6;
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -218,12 +234,54 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+/**
+ * @brief Predicts the obstacles locations in Frenet coordinates.
+ *
+ * @param[IN] sensor_fusion - Sensor fusion data from simulator
+ * @param[IN] t_0 - The initial time to start predicting from. Represent the time offset for the present.
+ * @param[IN] delta_t - The time difference between predictions.
+ * @param[IN] num_points - The number of predictions in addition to the current state.
+ * @param[IN] maps_x - The map waypoints in X coordinate.
+ * @param[IN] maps_y - The map waypoints in Y coordinate.
+ * @return a vector of predictions.
+ */
+vector<vector<Vehicle>> predict_obstacle_locations(const vector<vector<double>>& sensor_fusion, const double t_0, const double delta_t, const size_t num_points)
+{
+  vector<vector<Vehicle>> obstacle_predictions(sensor_fusion.size());
+
+  for (size_t obstacle_idx = 0; obstacle_idx < sensor_fusion.size(); ++obstacle_idx) {
+    Vehicle obstacle;
+
+    obstacle.id = sensor_fusion[obstacle_idx][SENSOR_FUSION_CAR_ID_IDX];
+    obstacle.s = sensor_fusion[obstacle_idx][SENSOR_FUSION_CAR_S_IDX];
+    obstacle.d = sensor_fusion[obstacle_idx][SENSOR_FUSION_CAR_D_IDX];
+
+    double obstacle_speed_x = sensor_fusion[obstacle_idx][SENSOR_FUSION_CAR_VEL_X_IDX];
+    double obstacle_speed_y = sensor_fusion[obstacle_idx][SENSOR_FUSION_CAR_VEL_Y_IDX];
+    obstacle.velocity = sqrt(obstacle_speed_x * obstacle_speed_x + obstacle_speed_y * obstacle_speed_y);
+
+
+    // Use simple physical model in order to predict the car locations.
+    obstacle.s = obstacle.s + obstacle.velocity * (t_0 - delta_t);
+    for (size_t pred_idx = 0; pred_idx <= num_points; ++pred_idx)
+    {
+      // Assuming that obstacle acceleration is zero and that obstacles
+      // don't change lanes in order to simplify predictions.
+      obstacle.s += obstacle.velocity * delta_t;
+      obstacle_predictions[obstacle_idx].push_back(obstacle);
+    }
+
+  }
+  return obstacle_predictions;
+}
+
 int main() {
   uWS::Hub h;
 
-  PathPlanner planner(SPEED_LIMIT, LANE_WIDTH, DELTA_T, SECONDS_AHEAD);
+  double planner_delta_t = PLANNER_DELTA_T;
+  size_t planner_path_size = PLANNER_PATH_SIZE;
 
-  size_t path_size = SECONDS_AHEAD / DELTA_T;
+
 
   // Load up map values for waypoint's x,y,s and d normalized normal vectors
   vector<double> map_waypoints_x;
@@ -259,8 +317,13 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&planner,&path_size](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  double last_car_speed = 0;
+
+  PathPlanner planner(SPEED_LIMIT, MAX_ACCELARAION, MAX_JERK, LANE_WIDTH, LANE_NUM, planner_delta_t, planner_path_size, max_s);
+
+  size_t path_size = SECONDS_AHEAD / DELTA_T;
+
+  h.onMessage([&](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -289,6 +352,11 @@ int main() {
         	double car_yaw = j[1]["yaw"];
         	double car_speed = j[1]["speed"];
 
+        	if (!last_car_speed)
+        	{
+        	  last_car_speed = mph2ms(car_speed);
+        	}
+
         	// Previous path data given to the Planner
           auto previous_path_x = j[1]["previous_path_x"];
           auto previous_path_y = j[1]["previous_path_y"];
@@ -316,6 +384,7 @@ int main() {
           double ref_car_x = car_x;
           double ref_car_y = car_y;
           double ref_car_yaw = car_yaw;
+          double ref_t = 0;
 
           // Check if we have at least two points in previous path because
           // in order to get the correct heading we need at least two points.
@@ -328,6 +397,8 @@ int main() {
             ref_car_x = previous_path_x[previous_path_size - 1];
             ref_car_y = previous_path_y[previous_path_size - 1];
             ref_car_yaw = atan2(ref_car_y - prev_car_y, ref_car_x - prev_car_x);
+
+            ref_t = previous_path_size * DELTA_T;
           }
           else
           {
@@ -340,10 +411,11 @@ int main() {
           /// Call the path planner and let it do its magic
           /////////////////////////////////////////////////////
           vector<double> ref_car_fernet = getFrenet(ref_car_x, ref_car_y, ref_car_yaw, map_waypoints_x, map_waypoints_y);
-          Vehicle vehicle = {ref_car_fernet[0], ref_car_fernet[1], car_speed};
-          cout << "Calling path planner." << endl;
-          Path car_path = planner.planPath(vehicle, sensor_fusion, previous_path_x.size());
-          cout << "Calling path planner done." << endl;
+          Vehicle vehicle = {Vehicle::NOT_OBSTACLE_VEHICLE_ID, ref_car_fernet[0], ref_car_fernet[1], last_car_speed};
+          auto obstacle_predications = predict_obstacle_locations(sensor_fusion, ref_t, planner_delta_t, planner_path_size);
+          //cout << "Calling path planner." << endl;
+          Path car_path = planner.planPath(vehicle, obstacle_predications);
+          //cout << "Calling path planner done." << endl;
 
           ////////////////////////
           /// Calculate spline
@@ -355,12 +427,12 @@ int main() {
           // Push previous car location and reference car location in order to make the spline smoother.
           spline_x.push_back(prev_car_x);
           spline_y.push_back(prev_car_y);
-          cout << prev_car_x << ",";
+
           spline_x.push_back(ref_car_x);
           spline_y.push_back(ref_car_y);
-          cout <<ref_car_x << ",";
+
           // convert path points to Cartesian coordinates and add them to spline.
-          for (size_t point_idx = 0; point_idx < car_path.length(); ++point_idx) {
+          for (size_t point_idx = 0; point_idx < car_path.size(); ++point_idx) {
             vector<double> cartesian = getXY(car_path.s[point_idx], car_path.d[point_idx], map_waypoints_s, map_waypoints_x, map_waypoints_y);
 
             spline_x.push_back(cartesian[0]);
@@ -382,9 +454,10 @@ int main() {
             spline_y[point_idx] = shift_x*shift_sin + shift_y*shift_cos;
 
           }
-          //TODO: if it keeps doing problems maybe try using spline from last time.
+
           tk::spline spline;
           spline.set_points(spline_x, spline_y);
+
 
           ///////////////////////////////////////////////////////////////
           /// Generate next XY points from spline and path acceleration
@@ -400,19 +473,14 @@ int main() {
 
           //TODO: save last speed or calculate it, the current speed is not the one that will be at the end.
           double t_final = previous_path_size * DELTA_T;
-          double next_v = mph2ms(car_speed) + car_path.acceleration * t_final;
+          double next_v = last_car_speed;
           double next_x = 0;
           double next_y = spline(next_x);
           double next_yaw = 0;
 
-          // TODO: Change this part
-          if (next_v > mph2ms(SPEED_LIMIT))
-          {
-            car_path.acceleration = 0;
-            next_v = mph2ms(SPEED_LIMIT);
-          }
-
-
+          // Caching of cosine and sine values for map coordinates transformation.
+          double cos_ref_yaw = cos(ref_car_yaw);
+          double sin_ref_yaw = sin(ref_car_yaw);
           for (size_t point = 1; point <= points_to_add; ++point)
           {
             double prev_x = next_x;
@@ -421,30 +489,23 @@ int main() {
             next_x += next_v*DELTA_T*cos(next_yaw);
             next_y = spline(next_x);
             next_v += car_path.acceleration*DELTA_T;
+            // Negative velocities are invalid so set the minimum velocity possible to zero.
+            if (next_v < 0)
+            {
+              next_v = 0;
+            }
+
             next_yaw = atan2(next_y - prev_y, next_x - prev_x);
 
-#if 0
-            while (next_yaw > 2 * pi())
-            {
-              next_yaw -= 2 * pi();
-              cout << "found big yaw" << endl;
-            }
-
-            while (next_yaw < -2 * pi())
-            {
-              next_yaw += 2 * pi();
-              cout << "found small yaw" << endl;
-            }
-#endif
-
             // Transform the points back to map coordinates.
-            // TODO: Maybe cache cos & sin
-            double x = ref_car_x + next_x*cos(ref_car_yaw) - next_y*sin(ref_car_yaw);
-            double y = ref_car_y + next_x*sin(ref_car_yaw) + next_y*cos(ref_car_yaw);
+            double x = ref_car_x + next_x*cos_ref_yaw - next_y*sin_ref_yaw;
+            double y = ref_car_y + next_x*sin_ref_yaw + next_y*cos_ref_yaw;
 
             next_x_vals.push_back(x);
             next_y_vals.push_back(y);
           }
+
+          last_car_speed = next_v;
 
           ///////////////////////////////////////
           /// Send path to the simulator

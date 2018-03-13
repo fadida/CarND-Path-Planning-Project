@@ -13,24 +13,6 @@ constexpr size_t SENSOR_FUSION_CAR_VEL_Y_IDX = 4;
 constexpr size_t SENSOR_FUSION_CAR_S_IDX = 5;
 constexpr size_t SENSOR_FUSION_CAR_D_IDX = 6;
 
-/**
- * @brief helper function for printing vectors.
- * @param vec The vector to print
- */
-template <typename T>
-inline void print_vector(const vector<T>& vec)
-{
-  cout << '[';
-  for (size_t idx = 0; idx < vec.size(); ++idx)
-  {
-    cout << vec[idx];
-    if (idx < vec.size() - 1)
-    {
-      cout << ", ";
-    }
-  }
-  cout << ']';
-}
 
 /**
  * @brief Finds the maximum value index in a vector
@@ -56,209 +38,155 @@ inline unsigned int arg_max(const vector<T>& vec)
 }
 
 /**
- * Path planner constructor
- * @param speed_limit
- * @param max_acceleration
- * @param max_jerk
- * @param lane_width
- * @param path_size
- * @param safety_time
+ * @brief Symmetric clipping of number to the range [-bound, bound].
+ * @param n - a number.
+ * @param bound - a bound.
+ * @return a number in range of [-bound, bound].
  */
-PathPlanner::PathPlanner(double speed_limit, double max_acceleration, float max_jerk, float lane_width, size_t path_size, float safety_time) :
-speed_limit_(speed_limit), max_acceleration_(max_acceleration), max_jerk_(max_jerk), lane_width_(lane_width), path_size_(path_size), safety_time_(safety_time)
+template <typename T>
+T clip(const T& n, const T& bound) {
+  return max(-bound, min(n, bound));
+}
+
+
+PathPlanner::PathPlanner(double speed_limit, double max_acceleration, float max_jerk, float lane_width, size_t n_lanes,
+                         double delta_t, size_t path_size, double max_s_val) :
+speed_limit_(speed_limit), max_acceleration_(max_acceleration), max_jerk_(max_jerk), lane_width_(lane_width),
+path_size_(path_size),
+delta_t_(delta_t), safety_distance_(INFINITY), max_s_val_(max_s_val), n_lanes_(n_lanes)
 {
   target_lane_ = PathPlanner::UNKNOWN_LANE;
-  prev_state_ = state_ = PATH_PLANNER_STATE_KEEP_LANE;
-  // Initialize path vector
-  path_ = {vector<double>(path_size_), vector<double>(path_size_), 0.0};
 
-  delta_t_ = 0.02;
+  prev_acceleration_ = 0;
 
+  // Reduce the limits in order to leave a safety zone for mistakes.
   speed_limit_ = 0.99 * speed_limit_;
-  speed_max_threshold_ = 0.99 * speed_limit_;
-  speed_min_threshold_ = 0.7 * speed_limit_;
+  max_acceleration_ = 0.90 * max_acceleration_;
+  max_jerk_ = 0.9 * max_jerk_;
 
-  target_vehicle_id_ = 0;
+  lane_velocities_ = vector<double>(n_lanes_, speed_limit_);
+
+  critical_s_loc_ = -INFINITY;
+
+  safety_time_ = delta_t_ / 2;
 }
 
 /**
  * @brief Create a path for the vehicle to follow.
- * @details
- *        Steps:
- *        1. Calculate velocities for each lane.
- *        2. Create path points.
- *        3. Calculate path acceleration.
- * @param vehicle        The vehicle initial position for path
- * @param sensor_fusion  Sensor fusion data.
+
+ * @param vehicle               The vehicle initial position for path
+ * @param obstacle_predictions  The obstacles
  * @return a path
  */
-Path PathPlanner::planPath(const Vehicle& vehicle, const vector<vector<double>>& sensor_fusion)
+Path PathPlanner::planPath(const Vehicle& vehicle, const vector<vector<Vehicle>>& obstacle_predictions)
 {
-  cout << "s=" << vehicle.s << ", d=" << vehicle.d << endl;
-  vector<double> lane_velocities = getLaneVelocities(vehicle, sensor_fusion);
   unsigned int current_lane = getLaneIndex(vehicle.d);
-  unsigned int fastest_lane = arg_max(lane_velocities);
+  vector<double> lane_velocities = calculateLaneVelocities(vehicle, obstacle_predictions);
+  updateLaneVelocities(lane_velocities);
 
-  cout << "Lane velocities: ";
-  print_vector(lane_velocities);
-  cout << endl;
-
-  // Decide on a path based on lane velocities and vehicle velocity.
-  if (current_lane == target_lane_)
+  // initialize planner variables at first run.
+  if (target_lane_  == UNKNOWN_LANE)
   {
-    int delta_lane = fastest_lane - current_lane;
-    if (1 || delta_lane == 0)
+    target_lane_ = current_lane;
+    initial_d_pos_ = vehicle.d;
+    initial_s_pos_ = vehicle.s;
+    critical_s_loc_ = vehicle.s;
+  }
+
+  vector<bool> clear_lanes = checkIfPathsAreClear(vehicle, obstacle_predictions);
+
+  // If lane is not clear (ie, we collide with car on it) reduce its
+  // velocity as a penalty.
+  for (size_t lane_idx = 0; lane_idx < n_lanes_; ++lane_idx)
+  {
+    if (!clear_lanes[lane_idx])
     {
-      // We are on the fastest lane, keep driving on this lane.
-      state_ = PATH_PLANNER_STATE_KEEP_LANE;
+      lane_velocities_[lane_idx] *= 1;
+    }
+  }
+
+
+  if (!clear_lanes[current_lane])
+  {
+    lane_velocities_[current_lane] *= 0.7;
+  }
+
+  if (canMakePathDecision(vehicle))
+  {
+    initial_d_pos_ = vehicle.d;
+    initial_s_pos_ = vehicle.s;
+
+    vector<double> costs = lane_velocities_;
+    // Current lane gets a bonus in order to prefer staying on lane
+    // when velocities for all lanes are the same.
+    costs[current_lane] *= 1.001;
+    unsigned int fastest_lane = arg_max(costs);
+
+    // Limit `target_lane` deviation to one lane.
+    if (current_lane == fastest_lane)
+    {
       target_lane_ = current_lane;
     }
-    else if (delta_lane < -1)
+    else if (current_lane > fastest_lane)
     {
-      state_ = PATH_PLANNER_STATE_SWITCH_LANE_LEFT;
       target_lane_ = current_lane - 1;
     }
     else
     {
-      state_ = PATH_PLANNER_STATE_SWITCH_LANE_RIGHT;
       target_lane_ = current_lane + 1;
     }
+
+    // Set the critical location: the point in which anther
+    // decision will be made.
+    // When we choose to keep lane the decision is immediate,
+    // and when we choose to change lanes we wait for the end of the change.
+    critical_s_loc_ = vehicle.s;
+    if (target_lane_ != current_lane)
+    {
+      critical_s_loc_ += lane_velocities_[target_lane_] * delta_t_ * path_size_ ;
+    }
   }
-  else if (target_lane_ == PathPlanner::UNKNOWN_LANE)
+  else
   {
-    target_lane_ = current_lane;
-  }
-  Path path = generatePathPoints(vehicle, lane_velocities);
-
-  cout << "Prev_State=" << prev_state_ << ", State=" << state_ << endl;
-  cout << "curr_lane="<< current_lane << ", target_lane=" << target_lane_ << endl;
-  // Calculate acceleration based on current lane velocity
-  double delta_velocity = lane_velocities[current_lane] - vehicle.velocity;
-
-  cout << "lane_vel="<<lane_velocities[current_lane]<<", vehicle speed=" << vehicle.velocity << ", delta=" << delta_velocity << endl;
-
-  path.acceleration = delta_velocity / delta_t_;
-
-  // Check that acceleration match max acceleration and jerk requirements.
-  if (path.acceleration > max_acceleration_)
-  {
-    path.acceleration = max_acceleration_;
-  }
-  else if (path.acceleration < -1 * max_acceleration_)
-  {
-    path.acceleration = -max_acceleration_;
+    // Override lane change decision when collision is detected.
+    if (!clear_lanes[target_lane_])
+    {
+      target_lane_ = current_lane;
+    }
   }
 
-  cout << "accel = " << path.acceleration << endl;
-
-  return path;
+  return createPath(vehicle, target_lane_);
 }
 
-Path PathPlanner::generatePathPoints(const Vehicle& vehicle, const vector<double>& lane_velocities)
-{
-  Path path = {vector<double>(path_size_), vector<double>(path_size_), 0.0};
-
-
-  double d = vehicle.d;
-  double s = vehicle.s;
-  double delta_d = 0;
-  double delta_s = 0;
-
-  double target_d = getDFromLane(target_lane_);
-
-  switch (state_)
-  {
-    case PATH_PLANNER_STATE_KEEP_LANE:
-      delta_d = (target_d - vehicle.d) / path_size_;
-      delta_s = speed_limit_;
-      prev_state_ = PATH_PLANNER_STATE_KEEP_LANE;
-      break;
-
-    case PATH_PLANNER_STATE_SWITCH_LANE_LEFT:
-      delta_d = (target_d - vehicle.d) / path_size_;
-      delta_s = 0.8 * speed_limit_;
-      cout << "Changing lane left - d_d=" << delta_d << ", d_s=" << delta_s << endl;
-      prev_state_ = PATH_PLANNER_STATE_SWITCH_LANE_LEFT;
-      break;
-
-    case PATH_PLANNER_STATE_SWITCH_LANE_RIGHT:
-      delta_d = (target_d - vehicle.d) / path_size_;
-      delta_s = 0.8 * speed_limit_;
-      cout << "Changing lane right - d_d=" << delta_d << ", d_s=" << delta_s << endl;
-      prev_state_ = PATH_PLANNER_STATE_SWITCH_LANE_RIGHT;
-      break;
-
-    default:
-      break;
-  }
-
-  for (size_t path_idx = 0; path_idx < path_size_; ++path_idx) {
-    d += delta_d;
-    s += delta_s;
-
-    path.d[path_idx] = d;
-    path.s[path_idx] = s;
-  }
-
-  return path;
-
-}
 
 /**
- * @brief Gets lane velocities based on other vehicles velocity.
+ * @brief Calculates lane velocities based on obstacles velocity.
  *
- * @details
- *
- *
- * @param[IN] vehicle       the vehicle data.
- * @param[IN] sensor_fusion the sensor fusion data.
- *
- * @return a vector of velocities.
+ * @param vehicle       the vehicle data.
+ * @param sensor_fusion the sensor fusion data.
  */
-vector<double> PathPlanner::getLaneVelocities(const Vehicle& vehicle, const vector<vector<double>>& sensor_fusion)
+vector<double> PathPlanner::calculateLaneVelocities(const Vehicle& vehicle, const vector<vector<Vehicle>>& obstacle_predictions)
 {
-  vector<double> velocities(3, speed_limit_);
+  vector<double> velocities(n_lanes_, speed_limit_);
 
-  double s_ref = vehicle.s;
-  double saftey_distance = safety_time_ * vehicle.velocity;
-
-  cout << "safety distance=" << saftey_distance << endl;
-  cout << "############################ getting velocities #######################" << endl;
-  for (size_t vehicle_idx = 0; vehicle_idx < sensor_fusion.size(); ++vehicle_idx)
+  updateSafetyDistance(vehicle);
+  for (size_t obstacle_idx = 0; obstacle_idx < obstacle_predictions.size(); ++obstacle_idx)
   {
-    cout << "processing obstacle (" << sensor_fusion[vehicle_idx][SENSOR_FUSION_CAR_ID_IDX] << ")" << endl;
-    double obstacle_s = sensor_fusion[vehicle_idx][SENSOR_FUSION_CAR_S_IDX];
-    double obstacle_d = sensor_fusion[vehicle_idx][SENSOR_FUSION_CAR_D_IDX];
+    Vehicle obstacle = obstacle_predictions[obstacle_idx][0];
 
-    double obstacle_speed_x = sensor_fusion[vehicle_idx][SENSOR_FUSION_CAR_VEL_X_IDX];
-    double obstacle_speed_y = sensor_fusion[vehicle_idx][SENSOR_FUSION_CAR_VEL_Y_IDX];
-
-    // Maybe ignore safety distance when vehicle is behind us and not in our lane.
-#if 0
-    // Ignore obstacles behind the vehicle.
-    if (obstacle_s < s_ref)
+    if (isObstacleBehind(vehicle, obstacle))
     {
-      cout << "Ignore due to s location (obs_s=" << obstacle_s << ")"<< endl;
-      continue;
-    }
-#endif
-    // Ignore obstacles outside the safety distance.
-    double delta_s = obstacle_s - vehicle.s;
-    double delta_d = obstacle_d - vehicle.d;
-    if (sqrt(delta_s * delta_s + delta_d * delta_d) > saftey_distance)
-    {
-      cout << "Ignore due to safety distance." << endl;
       continue;
     }
 
-    double obstacle_speed = sqrt(obstacle_speed_x * obstacle_speed_x + obstacle_speed_y * obstacle_speed_y);
-    unsigned int obstacle_lane = getLaneIndex(obstacle_d);
+    if (!isObstacleTooClose(vehicle, obstacle))
+    {
+      continue;
+    }
 
-    cout << "obs_lane=" << obstacle_lane << ", speed=" << obstacle_speed << endl;
-
-    velocities[obstacle_lane] = min(velocities[obstacle_lane], obstacle_speed);
+    unsigned int obstacle_lane = getLaneIndex(obstacle.d);
+    velocities[obstacle_lane] = min(velocities[obstacle_lane], obstacle.velocity);
   }
-  cout << "############################ done getting velocities #######################" << endl;
 
   return velocities;
 }
@@ -285,4 +213,240 @@ double PathPlanner::getDFromLane(unsigned int lane_idx)
   // Add an offset of half the lane width so that d coordinate
   // will be placed in the middle of the lane.
   return lane_width_ / 2 + lane_width_ * lane_idx;
+}
+
+/**
+ * @brief Checks which paths the vehicle can take
+ * @param vehicle The vehicle.
+ * @param obstacle_predictions The obstacles predictions.
+ * @return
+ */
+vector<bool> PathPlanner::checkIfPathsAreClear(const Vehicle& vehicle, const vector<vector<Vehicle>>& obstacle_predictions)
+{
+  vector<bool> is_clear(n_lanes_, true);
+  unsigned int current_lane = getLaneIndex(vehicle.d);
+
+  // Go over each lane
+  for(unsigned int lane_idx = 0; lane_idx < n_lanes_; ++lane_idx)
+  {
+
+    // If the difference between the current path and the target path is more then one lane, skip the calculation
+    // for this lane.
+    if ((max(current_lane, lane_idx) - min(current_lane, lane_idx)) >= 2)
+    {
+      continue;
+    }
+
+    Path path = createDummyPath(vehicle, lane_idx);
+
+    // Insert the present state into the path in order to check collisions in present state.
+    path.d.insert(path.d.begin(), vehicle.d);
+    path.s.insert(path.s.begin(), vehicle.s);
+
+    Vehicle future = vehicle;
+    for (size_t path_idx = 0; is_clear[lane_idx] && path_idx < path_size_ + 1; ++path_idx)
+    {
+      future.d  = path.d[path_idx];
+      future.s  = path.s[path_idx];
+
+      unsigned int future_vehicle_lane = getLaneIndex(future.d);
+
+      for (vector<Vehicle> obstacle_pred : obstacle_predictions)
+      {
+        Vehicle obstacle = obstacle_pred[path_idx];
+        unsigned int obstacle_lane = getLaneIndex(obstacle.d);
+        if (obstacle_lane == future_vehicle_lane && isObstacleTooClose(future, obstacle))
+        {
+          is_clear[lane_idx] = false;
+          break;
+        }
+      }
+      // Vehicle has constant acceleration so we need to update the speed.
+      future.velocity += path.acceleration * delta_t_;
+      // acceleration is calculated for the next `delta_t_`, most likely that after
+      // that it will become zero in order to preserve vehicle speed.
+      path.acceleration = 0;
+    }
+  }
+
+  return is_clear;
+}
+
+/**
+ * @brief update the safety distance based on vehicle state.
+ * @param vehicle The vehicle.
+ */
+void PathPlanner::updateSafetyDistance(const Vehicle& vehicle)
+{
+  safety_distance_ = safety_time_ * vehicle.velocity;
+}
+
+/**
+ * @brief Checks if two vehicles distance is less then the safety_distance.
+ * @param vehicle
+ * @param obstacle
+ * @return True/False
+ */
+bool PathPlanner::isObstacleTooClose(const Vehicle& vehicle, const Vehicle& obstacle)
+{
+  double delta_s = obstacle.s - vehicle.s;
+  double delta_d = obstacle.d - vehicle.d;
+  double safety_distance = safety_time_ * max(vehicle.velocity, obstacle.velocity);
+
+  return sqrt(delta_s * delta_s + delta_d * delta_d) < safety_distance;
+}
+
+/**
+ * @brief Checks if `obstacle` is directly behind `vehicle`
+ * @param vehicle
+ * @param obstacle
+ * @return True/False
+ */
+bool PathPlanner::isObstacleBehind(const Vehicle& vehicle, const Vehicle& obstacle)
+{
+  unsigned int vehicle_lane = getLaneIndex(vehicle.d);
+  unsigned int obstacle_lane = getLaneIndex(obstacle.d);
+
+  return /*vehicle_lane == obstacle_lane &&*/ obstacle.s < vehicle.s;
+}
+
+/**
+ * @brief Creates a path for a specific target lane.
+ * @param vehicle The vehicle
+ * @param target_lane_idx The lane the path will lead to.
+ * @return A path.
+ */
+Path PathPlanner::createPath(const Vehicle& vehicle, unsigned int target_lane_idx)
+{
+  Path path(path_size_);
+
+  path.acceleration = getPathAccelaration(vehicle, target_lane_idx);
+
+  unsigned int current_lane = getLaneIndex(vehicle.d);
+
+  double s = vehicle.s;
+  double d = getDFromLane(current_lane);
+
+  // When current lane and source lane are different those
+  // values are used in order to lead the vehicle for it current d location `src_d`
+  // to the target lane d value `dst_d`.
+  double src_d = initial_d_pos_;//vehicle.d;
+  double dst_d = getDFromLane(target_lane_idx);
+
+  // Assuming constant acceleration the maximum change in s will be `delta_s`.
+  double delta_s = vehicle.velocity * delta_t_ + 0.5 * path.acceleration * delta_t_ * delta_t_;
+  double delta_d = dst_d - src_d;
+
+  double dst_s = initial_s_pos_ + delta_s * path_size_ * 0.8;
+
+  for (size_t path_idx = 0; path_idx < path_size_; ++path_idx) {
+    s += delta_s;
+
+    if (current_lane != target_lane_idx)
+    {
+      // When planning lane change, advance in a linear line in Frenet space.
+      if (s <= dst_s)
+      {
+        d = src_d + delta_d*(s / dst_s);
+      }
+      else
+      {
+        d = dst_d;
+        current_lane = target_lane_idx;
+      }
+    }
+
+    path.s[path_idx] = s;
+    path.d[path_idx] = d;
+  }
+
+  return path;
+}
+
+/**
+ * @brief Calculate the path acceleration.
+ * @param vehicle
+ * @param target_lane_idx
+ * @return acceleration
+ */
+double PathPlanner::getPathAccelaration(const Vehicle& vehicle, unsigned int target_lane_idx)
+{
+  // Calculate acceleration based on current lane velocity
+  double acceleration = getTimeDerivative(vehicle.velocity, lane_velocities_[target_lane_idx]);
+  acceleration = clip(acceleration, max_acceleration_);
+
+  double jerk = getTimeDerivative(prev_acceleration_, acceleration);
+  jerk = clip(jerk, max_jerk_);
+
+  if (fabs(jerk) == max_jerk_)
+  {
+    acceleration = jerk * delta_t_;
+  }
+
+  prev_acceleration_ = acceleration;
+
+  return acceleration;
+}
+
+/**
+ * @brief approximate derivative using the planner `delta_t_`.
+ * @param x_initial
+ * @param x_final
+ * @return
+ */
+double PathPlanner::getTimeDerivative(double x_initial, double x_final)
+{
+  // This formula is not really a derivative because delta_t is not much smaller then 1.
+  double delta_x = x_final - x_initial;
+  return delta_x / delta_t_;
+}
+
+/**
+ * @brief Check if a new decision can be made.
+ * @param vehicle
+ * @return True/False
+ */
+bool PathPlanner::canMakePathDecision(const Vehicle& vehicle)
+{
+  if (vehicle.s > critical_s_loc_)
+  {
+    return true;
+  }
+
+  // Check for wrap-around
+  if (critical_s_loc_ > 0.9 * max_s_val_ && vehicle.s < 0.1 * max_s_val_ )
+  {
+    // Fix warp-around
+    return (max_s_val_ + vehicle.s) > critical_s_loc_;
+  }
+
+  return false;
+}
+
+/**
+ * @brief Update the lane velocities using moving average.
+ * @param lane_velocities
+ */
+void PathPlanner::updateLaneVelocities(const std::vector<double>& lane_velocities)
+{
+  double alpha = 0.7;
+  for (unsigned int lane_idx = 0; lane_idx < n_lanes_; ++lane_idx)
+  {
+    lane_velocities_[lane_idx] = (1-alpha) * lane_velocities_[lane_idx] + alpha * lane_velocities[lane_idx];
+  }
+}
+
+/**
+ * @brief Create a new path without side-effects.
+ * @param vehicle
+ * @param target_lane_idx
+ * @return the path
+ */
+Path PathPlanner::createDummyPath(const Vehicle& vehicle, unsigned int target_lane_idx)
+{
+  double prev_acceleration = prev_acceleration_;
+  Path path = createPath(vehicle, target_lane_idx);
+  prev_acceleration_ = prev_acceleration;
+
+  return path;
 }
